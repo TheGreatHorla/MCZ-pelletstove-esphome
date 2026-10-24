@@ -1,0 +1,54 @@
+# Dashboard > Kaart toevoegen > Handmatig. GEEN ESPHome-configuratie.
+# Entiteit-ID's zijn VOORBEELDEN: neem de werkelijke ID's uit jouw Home Assistant.
+# HA kan een ruimteprefix toevoegen, zoals woonkamer_pelletkachel_...
+# Gebruik bij temperature dezelfde sensor als mcz_living_sensor in ESPHome.
+type: custom:pelletkachel-card
+title: Pelletkachel
+subtitle: MCZ Ego Air 2.0
+
+# Pas alle zichtbare teksten hier aan. Geen JavaScript-wijziging nodig.
+labels:
+  fan1: Ventilator 1
+  fan2: Ventilator 2
+  target: Gewenst
+  decrease: Temperatuur verlagen
+  increase: Temperatuur verhogen
+  source_ha: HA
+  source_remote: Afstandsbediening
+  no_temperature: Geen geldige livingtemperatuur. Auto kan niet starten.
+  living: Living
+  heating: Verwarming
+  mode: Modus
+  power: Vermogen
+  fans: Ventilatoren
+  auto: Auto
+  manual: Manueel
+  eco: Eco
+  turn_on: Aanzetten
+  turn_off: Uitzetten
+  fan_off: "0"
+  last_command: Laatste opdracht
+  on_requested: Aan gevraagd
+  off_requested: Uit gevraagd
+  unknown: Onbekend
+  unavailable: Niet beschikbaar
+  off_hint: Bij aanzetten worden deze instellingen gebruikt.
+  unknown_hint: Nog geen opdracht ontvangen sinds de herstart.
+  pending: Bezig…
+  error: Opdracht mislukt. Probeer opnieuw.
+  missing: "Controleer de entity-ID’s in de kaartconfiguratie:"
+  configure: "Configureer entities.{key} met een {domain}-entiteit."
+
+entities:
+  target: number.pelletkachel_doeltemperatuur
+  last_command: sensor.pelletkachel_laatste_opdracht_details
+  temperature: sensor.woonkamer_temperatuur
+  command_mode: sensor.pelletkachel_laatste_opdracht_modus
+  mode: select.pelletkachel_te_zenden_modus
+  power: number.pelletkachel_te_zenden_vermogen
+  fan1: select.pelletkachel_te_zenden_ventilator_1
+  fan2: select.pelletkachel_te_zenden_ventilator_2
+  turn_on: button.pelletkachel_aan
+  turn_off: button.pelletkachel_uit
+  # Interne zendactie: geen zichtbare toepassen-knop meer.
+  apply: button.pelletkachel_instellingen_versturen

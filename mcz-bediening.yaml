@@ -1,0 +1,613 @@
+# MCZ Ego 2.0 Comfort Air - LilyGO T3 v1.6.1, 433 MHz / SX1278
+# SPDX-License-Identifier: MIT
+# ESPHome 2026.10.0, ESP-IDF. Publieke configuratie; geen persoonlijke gegevens.
+# Bewaar als /homeassistant/esphome/packages/mcz-bediening.yaml.
+# VERVANG de oude ontvangst-package in pelletkachel.yaml door:
+# packages:
+#   mcz_bediening: !include packages/mcz-bediening.yaml
+# Behoud wifi, display, SPI en het bestaande sx127x-blok in het hoofdbestand.
+# Laad de oude ontvangst-package niet tegelijk; geen extra remote_receiver-blok.
+#
+# Versie 1.2.1: Auto is de regeling op basis van de HA-livingsensor.
+# Doeltemperatuur: 10..30 °C, stap 0.5, eerste waarde 20; daarna bewaard.
+# Verschil doel-gemeten: >=2 -> 5; 0.5..1 -> 3; <0.5 -> 1.
+# Tussen 1 en 2: vorige regelstand; bij eerste gebruik huidige 1/3/5, anders 3.
+# Elke nieuwe regelstand zet vermogen EN fan1; fan2 blijft onafhankelijk.
+# Handmatige fan1-keuze blijft tot volgende overgang naar een andere regelstand.
+# Auto stuurt MANUAL-pakketten; alleen ESPHome bepaalt dan het vermogen.
+# Manueel/Eco stoppen deze regeling. Uit/onbekend en herstart starten nooit zelf.
+# Wijzigingen vanuit de afstandsbediening worden ontvangen en kunnen HA overrulen.
+# Bij ontbrekende temperatuur/API gaat actieve Auto naar vermogen/fan1=1.
+# Auto inschakelen zonder geldige temperatuur wordt geweigerd; Uit blijft mogelijk.
+# Een streeftemperatuur bereiken schakelt NIET uit: minimumvermogen blijft 1.
+# Fan2=0 bevestigd met een ontvangen pakket op de geteste kachel.
+# Softwarevalidatie is geen bevestiging dat de kachel een radio-opdracht uitvoert.
+
+# Overschrijf deze substitutions in je hoofdbestand.
+# ID=0 is alleen luisteren/ID ontdekken: alle radiozendingen worden geblokkeerd.
+substitutions:
+  mcz_remote_id: "0x000000"
+  mcz_living_sensor: "sensor.woonkamer_temperatuur"
+
+# Alleen gewijzigde voorkeuren worden geschreven; groepeer snelle wijzigingen.
+preferences:
+  flash_write_interval: 10s
+
+# Wordt samengevoegd met jouw bestaande sx127x-instellingen.
+sx127x:
+  id: mcz_radio
+  pa_pin: BOOST
+  pa_power: 10
+
+esphome:
+  on_boot:
+    priority: -100
+    then:
+      # Open-drain datapin vrijgeven voor ontvangst; geen radiozending.
+      - sx127x.set_mode_standby: mcz_radio
+      - remote_transmitter.digital_write:
+          transmitter_id: mcz_tx
+          value: true
+      - sx127x.set_mode_rx: mcz_radio
+      - text_sensor.template.publish:
+          id: mcz_opdracht
+          state: "Onbekend (nog geen opdracht)"
+      - text_sensor.template.publish:
+          id: mcz_command_mode
+          state: "UNKNOWN"
+      - text_sensor.template.publish:
+          id: mcz_details
+          state: '{}'
+      - text_sensor.template.publish:
+          id: mcz_regelstatus
+          state: "Inactief"
+globals:
+  - id: mcz_regelstand
+    type: int
+    restore_value: no
+    initial_value: '0'
+  - id: mcz_tx_bezig
+    type: bool
+    restore_value: no
+    initial_value: 'false'
+  - id: mcz_tx_klaar_ms
+    type: uint32_t
+    restore_value: no
+    initial_value: '0'
+  - id: mcz_tx_geweest
+    type: bool
+    restore_value: no
+    initial_value: 'false'
+  - id: mcz_laatste_modus
+    type: int
+    restore_value: no
+    initial_value: '-1'
+  - id: mcz_rx_ooit_ontvangen
+    type: bool
+    restore_value: no
+    initial_value: 'false'
+  - id: mcz_rx_laatst_ms
+    type: uint32_t
+    restore_value: no
+    initial_value: '0'
+
+text_sensor:
+  - platform: template
+    name: "Laatste opdracht details"
+    id: mcz_details
+    update_interval: never
+  - platform: template
+    name: "Temperatuurregeling"
+    id: mcz_regelstatus
+    update_interval: never
+  # Stabiele protocolwaarden voor de kaart, los van vertaalde weergaveteksten.
+  - platform: template
+    name: "Laatste opdracht modus"
+    id: mcz_command_mode
+    update_interval: never
+  - platform: template
+    name: "Laatste opdracht (onbevestigd)"
+    id: mcz_opdracht
+    update_interval: never
+  - platform: template
+    name: "Laatste HA-zendpoging"
+    id: mcz_tx_pakket
+    entity_category: diagnostic
+    update_interval: never
+  - platform: template
+    name: "Ontvangen modus"
+    id: mcz_rx_modus
+    update_interval: never
+  - platform: template
+    name: "Ontvangen ventilator 1"
+    id: mcz_rx_fan1
+    update_interval: never
+  - platform: template
+    name: "Ontvangen ventilator 2"
+    id: mcz_rx_fan2
+    update_interval: never
+  - platform: template
+    name: "Ontvangen MCZ-pakket"
+    id: mcz_rx_pakket
+    entity_category: diagnostic
+    update_interval: never
+
+sensor:
+  - platform: homeassistant
+    id: mcz_living
+    entity_id: ${mcz_living_sensor}
+    internal: true
+    on_value:
+      - script.execute: mcz_regel
+  - platform: template
+    name: "Ontvangen vermogensstand"
+    id: mcz_rx_vermogen
+    accuracy_decimals: 0
+    update_interval: never
+  - platform: template
+    name: "Tijd sinds MCZ-ontvangst"
+    entity_category: diagnostic
+    unit_of_measurement: s
+    accuracy_decimals: 0
+    update_interval: 5s
+    lambda: |-
+      if (!id(mcz_rx_ooit_ontvangen)) return NAN;
+      return (uint32_t)(millis() - id(mcz_rx_laatst_ms)) / 1000.0f;
+
+remote_receiver:
+  id: mcz_rx
+  pin:
+    number: GPIO32
+    allow_other_uses: true
+    mode:
+      input: true
+      output: true
+      pullup: true
+      open_drain: true
+  filter: 50us
+  idle: 1ms
+  # Geen dump: raw: alleen gecontroleerde pakketten verschijnen in de log.
+  on_raw:
+    then:
+      - lambda: |-
+          // Deze decoder is afgestemd op de bytefragmenten bij idle: 1ms.
+          // ESPHome RawDumper laat het laatste element van x weg. Doe hier
+          // hetzelfde, zodat de verwerking overeenkomt met de geteste logs.
+          static uint8_t packet[7] = {};
+          static size_t used = 0;
+          static uint32_t last_word_ms = 0;
+          static uint8_t previous[7] = {};
+          static bool have_previous = false;
+          static uint32_t last_report_ms = 0;
+          const uint32_t now = millis();
+          if (id(mcz_tx_bezig) || (id(mcz_tx_geweest) &&
+              (uint32_t)(now - id(mcz_tx_klaar_ms)) < 100)) {
+            used = 0;
+            return;
+          }
+          if ((uint32_t)(now - last_word_ms) > 250) used = 0;
+
+          if (x.size() < 15 || x.size() > 26) return;
+          const size_t count = x.size() - 1;
+          if (x[0] >= 0) { used = 0; return; }
+
+          // Eerste positieve halve startbit ontbreekt in deze fragmenten.
+          uint8_t levels[26] = {1};
+          size_t length = 1;
+          for (size_t i = 0; i < count; i++) {
+            const int64_t duration = x[i] < 0 ? -(int64_t)x[i] : (int64_t)x[i];
+            if (duration < 280 || duration > 1000) { used = 0; return; }
+            const int halves = (int)((duration + 209) / 418);
+            if (halves < 1 || halves > 2 || length + halves > 25) {
+              used = 0;
+              return;
+            }
+            for (int j = 0; j < halves; j++) levels[length++] = x[i] > 0;
+          }
+          // Laatste byte mist soms de afsluitende lage halve stopbit.
+          if (length == 23) levels[length++] = 0;
+          if (length != 24 && length != 25) { used = 0; return; }
+
+          uint16_t word = 0;
+          for (size_t i = 0; i < 24; i += 2) {
+            if (levels[i] == levels[i + 1]) { used = 0; return; }
+            word = (word << 1) | levels[i];  // 10 = 1, 01 = 0
+          }
+          if ((word & 0x801) != 0x801) { used = 0; return; }
+          uint8_t parity = 0;
+          for (int bit = 1; bit <= 10; bit++) parity ^= (word >> bit) & 1;
+          if (parity != 0) { used = 0; return; }
+          const bool first_byte = (word & 4) != 0;
+          if (first_byte) used = 0;
+          else if (used == 0) return;
+          packet[used++] = (word >> 3) & 0xFF;
+          last_word_ms = now;
+          if (used < 7) return;
+          used = 0;
+
+          uint16_t crc = 0;  // CRC16-XMODEM: poly 0x1021, init 0.
+          for (size_t i = 0; i < 5; i++) {
+            crc ^= (uint16_t)packet[i] << 8;
+            for (int bit = 0; bit < 8; bit++)
+              crc = (crc & 0x8000) ? (crc << 1) ^ 0x1021 : crc << 1;
+          }
+          const uint16_t received_crc = ((uint16_t)packet[5] << 8) | packet[6];
+          if (crc != received_crc) return;
+          const uint32_t remote_id = ((uint32_t)packet[0] << 16)
+                                  | ((uint32_t)packet[1] << 8) | packet[2];
+          constexpr uint32_t configured_id = ${mcz_remote_id};
+          static_assert(configured_id <= 0xFFFFFF, "MCZ remote ID must fit in 24 bits");
+          if (configured_id == 0) {
+            ESP_LOGI("mcz_discovery", "CRC OK | ID=%06X | modus=%u | vermogen=%u | fan1=%u | fan2=%u",
+                     (unsigned)remote_id, (unsigned)(packet[3] & 3),
+                     (unsigned)((packet[3] >> 2) & 7), (unsigned)(packet[3] >> 5),
+                     (unsigned)((packet[4] >> 3) & 7));
+            return;  // Niet als eigen opdracht verwerken voordat een ID is gekozen.
+          }
+          if (remote_id != configured_id) return;
+          id(mcz_rx_ooit_ontvangen) = true;
+          id(mcz_rx_laatst_ms) = now;
+
+          // Vijf identieke kopieen per zendburst: log/publiceer er een.
+          // Een nieuwe burst na 30 seconden blijft wel zichtbaar.
+          bool same = have_previous;
+          for (size_t i = 0; i < 7; i++) same = same && previous[i] == packet[i];
+          if (same && (uint32_t)(now - last_report_ms) < 1000) return;
+          for (size_t i = 0; i < 7; i++) previous[i] = packet[i];
+          have_previous = true;
+          last_report_ms = now;
+
+          const char *modes[] = {"OFF", "MANUAL", "AUTO", "ECO"};
+          const char *mode = modes[packet[3] & 3];
+          const unsigned power = (packet[3] >> 2) & 7;
+          const unsigned fan1 = packet[3] >> 5;
+          const unsigned fan2 = (packet[4] >> 3) & 7;
+          auto fan_text = [](unsigned value) -> std::string {
+            if (value == 6) return "AUTO";
+            if (value == 7) return "Niet aanwezig (7)";
+            return std::to_string(value);
+          };
+          const std::string f1 = fan_text(fan1);
+          const std::string f2 = fan_text(fan2);
+          char hex[21];
+          snprintf(hex, sizeof(hex), "%02X %02X %02X %02X %02X %02X %02X",
+                   (unsigned)packet[0], (unsigned)packet[1], (unsigned)packet[2],
+                   (unsigned)packet[3], (unsigned)packet[4], (unsigned)packet[5],
+                   (unsigned)packet[6]);
+          ESP_LOGI("mcz_rx", "ID=%06X | modus=%s | vermogen=%u | fan1=%s | fan2=%s | CRC OK | %s",
+                   (unsigned)remote_id, mode, power, f1.c_str(), f2.c_str(), hex);
+          id(mcz_rx_modus).publish_state(mode);
+          id(mcz_rx_vermogen).publish_state(power);
+          id(mcz_rx_fan1).publish_state(f1);
+          id(mcz_rx_fan2).publish_state(f2);
+          id(mcz_rx_pakket).publish_state(hex);
+
+          // Template-controls bewaren ook ontvangen wijzigingen in flash.
+          // Hun control-acties zenden NIETS: alleen mcz_zend verstuurt RF.
+          const int mode_num = packet[3] & 3;
+          id(mcz_laatste_modus) = mode_num;
+          id(mcz_opdracht).publish_state(std::string("Afstandsbediening: ") + mode);
+          id(mcz_command_mode).publish_state(mode);
+          char details[150];
+          snprintf(details, sizeof(details), "{\"source\":\"remote\",\"mode\":\"%s\",\"power\":%u,\"fan1\":%u,\"fan2\":%u}", mode, power, fan1, fan2);
+          id(mcz_details).publish_state(details);
+          if (mode_num != 2) id(mcz_regelstand) = 0;
+          if (mode_num != 0) {
+            auto call = id(mcz_keuze_modus).make_call();
+            call.set_option(mode);
+            call.perform();
+          }
+          if (power >= 1 && power <= 5) {
+            auto call = id(mcz_keuze_vermogen).make_call();
+            call.set_value(power);
+            call.perform();
+          }
+          if (fan1 >= 1 && fan1 <= 6) {
+            auto call = id(mcz_keuze_fan1).make_call();
+            call.set_option(f1);
+            call.perform();
+          }
+          if (fan2 <= 6) {
+            auto call = id(mcz_keuze_fan2).make_call();
+            call.set_option(f2);
+            call.perform();
+          }
+
+# De SX1278 deelt DIO2/GPIO32 voor ontvangen en zenden.
+remote_transmitter:
+  id: mcz_tx
+  pin:
+    number: GPIO32
+    allow_other_uses: true
+    mode:
+      input: true
+      output: true
+      pullup: true
+      open_drain: true
+  carrier_duty_percent: 100%
+  eot_level: false
+  non_blocking: true
+  rmt_symbols: 64
+  on_transmit:
+    then:
+      - lambda: 'id(mcz_tx_bezig) = true;'
+      - sx127x.set_mode_standby: mcz_radio
+      - remote_transmitter.digital_write:
+          transmitter_id: mcz_tx
+          value: false
+      - sx127x.set_mode_tx: mcz_radio
+  on_complete:
+    then:
+      - sx127x.set_mode_standby: mcz_radio
+      - remote_transmitter.digital_write:
+          transmitter_id: mcz_tx
+          value: true
+      - sx127x.set_mode_rx: mcz_radio
+      - lambda: |-
+          id(mcz_tx_klaar_ms) = millis();
+          id(mcz_tx_geweest) = true;
+          id(mcz_tx_bezig) = false;
+          ESP_LOGI("mcz_tx", "Zendpoging klaar; ontvangst hervat. Geen kachelbevestiging.");
+
+# Deze keuzes bereiden een opdracht voor; ze zenden nooit zelfstandig.
+select:
+  - platform: template
+    name: "Te zenden modus"
+    id: mcz_keuze_modus
+    optimistic: true
+    restore_value: true
+    initial_option: "AUTO"
+    options: ["AUTO", "MANUAL", "ECO"]
+  - platform: template
+    name: "Te zenden ventilator 1"
+    id: mcz_keuze_fan1
+    optimistic: true
+    restore_value: true
+    initial_option: "AUTO"
+    options: ["1", "2", "3", "4", "5", "AUTO"]
+  - platform: template
+    name: "Te zenden ventilator 2"
+    id: mcz_keuze_fan2
+    optimistic: true
+    restore_value: true
+    initial_option: "AUTO"
+    options: ["1", "2", "3", "4", "5", "AUTO", "0"]  # Achteraan: behoud opgeslagen optie-indexen.
+
+number:
+  - platform: template
+    name: "Doeltemperatuur"
+    id: mcz_doeltemperatuur
+    optimistic: true
+    restore_value: true
+    initial_value: 20
+    min_value: 10
+    max_value: 30
+    step: 0.5
+    unit_of_measurement: "°C"
+    mode: box
+    on_value:
+      - script.execute: mcz_regel
+  - platform: template
+    name: "Te zenden vermogen"
+    id: mcz_keuze_vermogen
+    optimistic: true
+    restore_value: true
+    initial_value: 3
+    min_value: 1
+    max_value: 5
+    step: 1
+    mode: box
+
+button:
+  - platform: template
+    name: "Aan"
+    icon: mdi:power
+    on_press:
+      - script.execute:
+          id: mcz_opdracht_maken
+          actie: 1
+  - platform: template
+    name: "Uit"
+    icon: mdi:power-off
+    on_press:
+      - script.execute:
+          id: mcz_opdracht_maken
+          actie: 0
+  - platform: template
+    name: "Instellingen versturen"
+    icon: mdi:send
+    on_press:
+      - script.execute:
+          id: mcz_opdracht_maken
+          actie: 2
+
+interval:
+  - interval: 30s
+    then:
+      - script.execute: mcz_regel
+
+script:
+  # Maak een momentopname van de keuzes zodat ontvangen data een wachtende
+  # opdracht niet onbedoeld wijzigt. Actie: 0=Uit, 1=Aan, 2=instellingen toepassen.
+  - id: mcz_opdracht_maken
+    mode: single
+    parameters:
+      actie: int
+    then:
+      - lambda: |-
+          if (actie == 2 && id(mcz_laatste_modus) <= 0) {
+            ESP_LOGW("mcz_tx", "Laatste opdracht is OFF/onbekend. Gebruik Aan om te starten.");
+            return;
+          }
+          const auto mode_name = id(mcz_keuze_modus).current_option().str();
+          if (actie != 0 && mode_name == "AUTO") {
+            const bool available = api::global_api_server->is_connected_with_state_subscription()
+                && std::isfinite(id(mcz_living).state) && std::isfinite(id(mcz_doeltemperatuur).state);
+            if (actie == 1 && !available) {
+              id(mcz_regelstatus).publish_state("Geen temperatuur: Auto niet gestart");
+              ESP_LOGW("mcz_regeling", "Auto niet gestart: geen geldige livingtemperatuur/API.");
+              return;
+            }
+            id(mcz_auto_bereken).execute(actie == 1);
+          } else {
+            id(mcz_regelstand) = 0;
+            id(mcz_regelstatus).publish_state("Inactief");
+          }
+          const int mode = actie == 0 ? 0 : (mode_name == "ECO" ? 3 : 1);
+          const int power = (int)id(mcz_keuze_vermogen).state;
+          auto fan_value = [](const std::string &s) -> int {
+            if (s == "AUTO") return 6;
+            if (s.size() == 1 && s[0] >= '0' && s[0] <= '5') return s[0] - '0';
+            return 6;
+          };
+          id(mcz_zend).execute(mode, power,
+                              fan_value(id(mcz_keuze_fan1).current_option().str()),
+                              fan_value(id(mcz_keuze_fan2).current_option().str()));
+
+  - id: mcz_zend
+    mode: queued
+    max_runs: 10
+    parameters:
+      mode: int
+      power: int
+      fan1: int
+      fan2: int
+    then:
+      - lambda: |-
+          constexpr uint32_t configured_id = ${mcz_remote_id};
+          static_assert(configured_id <= 0xFFFFFF, "MCZ remote ID must fit in 24 bits");
+          if (configured_id == 0) {
+            ESP_LOGW("mcz_tx", "Alleen luisteren: stel mcz_remote_id in voordat je zendt.");
+            return;
+          }
+          if (mode < 0 || mode > 3 || power < 1 || power > 5 ||
+              fan1 < 1 || fan1 > 6 || fan2 < 0 || fan2 > 6) {
+            ESP_LOGE("mcz_tx", "Ongeldige opdracht; niet verzonden.");
+            return;
+          }
+          // BEGIN MCZ ENCODER (ook zelfstandig getest)
+          uint8_t packet[7] = {(uint8_t)(configured_id >> 16),
+              (uint8_t)(configured_id >> 8), (uint8_t)configured_id,
+              (uint8_t)((fan1 << 5) | (power << 2) | mode),
+              (uint8_t)((2 << 6) | (fan2 << 3) | 7), 0, 0};
+          uint16_t crc = 0;
+          for (int i = 0; i < 5; i++) {
+            crc ^= (uint16_t)packet[i] << 8;
+            for (int bit = 0; bit < 8; bit++)
+              crc = (crc & 0x8000) ? (crc << 1) ^ 0x1021 : crc << 1;
+          }
+          packet[5] = crc >> 8;
+          packet[6] = crc & 0xFF;
+
+          std::vector<int32_t> waveform;
+          waveform.reserve(900);
+          auto pulse = [&waveform](bool high, int32_t duration) {
+            const int32_t value = high ? duration : -duration;
+            if (!waveform.empty() && (waveform.back() > 0) == high)
+              waveform.back() += value;
+            else
+              waveform.push_back(value);
+          };
+          auto bit = [&pulse](bool one) {
+            pulse(one, 418);
+            pulse(!one, 418);
+          };
+          pulse(true, 103000);
+          for (int repeat = 0; repeat < 5; repeat++) {
+            for (int i = 0; i < 7; i++) {
+              const uint16_t payload = ((uint16_t)packet[i] << 1) | (i == 0 ? 1 : 0);
+              uint8_t parity = 0;
+              for (int b = 0; b < 9; b++) parity ^= (payload >> b) & 1;
+              const uint16_t word = 0x801 | (payload << 2) | (parity << 1);
+              bit(false);
+              pulse(true, 418);
+              for (int b = 11; b >= 0; b--) bit((word >> b) & 1);
+            }
+            pulse(false, 3712);
+          }
+          // END MCZ ENCODER
+
+          char hex[21];
+          snprintf(hex, sizeof(hex), "%02X %02X %02X %02X %02X %02X %02X",
+                   packet[0], packet[1], packet[2], packet[3], packet[4], packet[5], packet[6]);
+          const char *modes[] = {"OFF", "MANUAL", "AUTO", "ECO"};
+          ESP_LOGI("mcz_tx", "Zendpoging %s | vermogen=%d | fan1=%d | fan2=%d | %s",
+                   modes[mode], power, fan1, fan2, hex);
+          id(mcz_tx_pakket).publish_state(hex);
+          id(mcz_laatste_modus) = mode;
+          id(mcz_command_mode).publish_state(modes[mode]);
+          char details[150];
+          const char *ui_mode = mode == 0 ? "OFF" :
+              (id(mcz_keuze_modus).current_option().str() == "AUTO" ? "AUTO" : modes[mode]);
+          snprintf(details, sizeof(details), "{\"source\":\"ha\",\"mode\":\"%s\",\"power\":%d,\"fan1\":%d,\"fan2\":%d}", ui_mode, power, fan1, fan2);
+          id(mcz_details).publish_state(details);
+          id(mcz_opdracht).publish_state(std::string("HA: ") + modes[mode] + " (onbevestigd)");
+          auto call = id(mcz_tx).transmit();
+          call.get_data()->set_carrier_frequency(0);
+          call.get_data()->set_data(waveform);
+          call.perform();
+      - wait_until:
+          condition:
+            lambda: 'return !id(mcz_tx_bezig);'
+      - delay: 100ms
+
+  # Pure berekening/control-update; deze script zendt zelf niets.
+  - id: mcz_auto_bereken
+    mode: single
+    parameters:
+      force_fan: bool
+    then:
+      - lambda: |-
+          const float actual = id(mcz_living).state;
+          const float target = id(mcz_doeltemperatuur).state;
+          const bool connected = api::global_api_server->is_connected_with_state_subscription();
+          const bool valid = connected && std::isfinite(actual) && std::isfinite(target);
+          int next = id(mcz_regelstand);
+          if (next != 1 && next != 3 && next != 5) {
+            const int saved = (int)id(mcz_keuze_vermogen).state;
+            next = (saved == 1 || saved == 3 || saved == 5) ? saved : 3;
+          }
+          if (!valid) {
+            next = 1;
+            force_fan = true;
+            if (!connected && std::isfinite(actual)) id(mcz_living).publish_state(NAN);
+            id(mcz_regelstatus).publish_state("Geen temperatuur/API: minimumstand 1");
+          } else {
+            const float difference = target - actual;
+            if (difference >= 2.0f) next = 5;
+            else if (difference < 0.5f) next = 1;
+            else if (difference <= 1.0f) next = 3;
+            id(mcz_regelstatus).publish_state("Auto actief");
+          }
+          if (force_fan || next != id(mcz_regelstand)) {
+            auto fan = id(mcz_keuze_fan1).make_call();
+            fan.set_option(std::to_string(next));
+            fan.perform();
+          }
+          id(mcz_regelstand) = next;
+          if ((int)id(mcz_keuze_vermogen).state != next) {
+            auto power = id(mcz_keuze_vermogen).make_call();
+            power.set_value(next);
+            power.perform();
+          }
+
+  - id: mcz_regel
+    mode: restart
+    then:
+      - delay: 500ms
+      - lambda: |-
+          if (id(mcz_laatste_modus) <= 0 || id(mcz_keuze_modus).current_option().str() != "AUTO") {
+            id(mcz_regelstand) = 0;
+            id(mcz_regelstatus).publish_state("Inactief");
+            return;
+          }
+          if (id(mcz_tx_bezig) || id(mcz_zend).is_running()) return;
+          const int old_power = (int)id(mcz_keuze_vermogen).state;
+          const auto old_fan = id(mcz_keuze_fan1).current_option().str();
+          const int old_stage = id(mcz_regelstand);
+          id(mcz_auto_bereken).execute(false);
+          if (old_power != (int)id(mcz_keuze_vermogen).state ||
+              old_fan != id(mcz_keuze_fan1).current_option().str() ||
+              old_stage == 0 || id(mcz_laatste_modus) != 1) {
+            id(mcz_opdracht_maken).execute(2);
+          }
